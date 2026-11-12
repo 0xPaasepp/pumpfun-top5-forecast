@@ -1,32 +1,17 @@
 #!/usr/bin/env python3
-"""pumpfun-top5-forecast-01: Monte Carlo log-cap forecaster (v5).
+"""pumpfun-top5-forecast-01: Monte Carlo log-cap forecaster (v2).
+
+v2 is the proven best model: practice log_score -34.5 (rank 29/340).
+v3 (-35.707), v4 (-35.6) and v5 (-36.5) all scored worse in reality
+despite better backtests / settle-split gains, so v2 is restored as
+the final entry.  Do not re-tune on backtest splits: they do not
+predict the real practice score.
 
 Reads /input/task.json + /input/history.ndjson (10-minute marks of pump.fun
 coins launched since t0, ranked by market cap) and writes
 /output/forecast.json: for each of the 5 places, a probability for each coin
 named being at that place, the guessed top 5 in order, and for each place a
 probability for each log10(SOL) market-cap bin.
-
-Model (v5 changes vs v2)
-------------------------
-v2 is the proven best on the real practice score (log -34.5, rank 29);
-v3 (-35.707) and v4 (-35.6) both regressed in reality despite much
-better backtests, because backtest splits are in-sample short-horizon
-while the real practice is out-of-sample. v5 keeps v2's order model and
-removes the v3/v4 size premium entirely. It adds REGIME-ADAPTIVE
-confidence, because the practice market settled (churn 0.8 -> 0.2 at
-20:40) and v2 is underconfident there: it gives the dominant #1 coin
-only p=0.17 and leaves 40% mass unnamed.
-- Newcomer mass is MULTIPLICATIVE in churn (v2 added slope*horizon to
-  churn, so a settled market still left 0.35 unnamed at 0.5h). Now a
-  settled market stays mostly named; a churning market still opens up
-  fast and caps at 0.65 at long horizons.
-- Temperature is churn-adaptive: sharper toward T=1.0 when settled,
-  v2's T=1.15 when churning.
-- Size widening is churn-scaled: narrower in a settled market (caps
-  barely move), wider when churning. v2 widened the same in any regime.
-All three changes preserve v2's long-horizon / high-churn behaviour
-(the final grading window), so the final score should not collapse.
 
 Model (v2 changes vs v1)
 ------------------------
@@ -161,14 +146,11 @@ def top5_churn(marks):
 def newcomer_share(churn, horizon_hours):
     """Probability a place is taken by a coin no history can name.
 
-    v5: MULTIPLICATIVE in churn and SUPERLINEAR (churn^1.5). v2 added
-    slope*horizon to churn, so even a settled market (churn 0.2) left
-    0.35 unnamed at a 0.5h horizon -- far more than the true newcomer
-    rate in a settled market, diluting every named coin. Here a settled
-    market stays mostly named (churn^1.5 crushes low churn), a churning
-    market still opens up fast and caps at 0.65 at long horizons.
+    Starts at the market's own churn rate and grows with the answer
+    horizon (more time = more births and more turnover), capped so the
+    named coins still carry real mass.
     """
-    return min(NEWCOMER_CAP, (churn ** 1.5) * (1.0 + NEWCOMER_SLOPE * max(0.0, horizon_hours)))
+    return min(NEWCOMER_CAP, churn + NEWCOMER_SLOPE * max(0.0, horizon_hours))
 
 
 def estimate_params(traj, last_time, t0):
@@ -246,20 +228,13 @@ def norm_cdf(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
-def size_widen(horizon_hours, n_marks, churn=0.30):
+def size_widen(horizon_hours, n_marks):
     """Extra widening of the simulated size distribution: grows with the
     answer horizon (model error compounds) and with thin history (fewer
-    marks = more uncertainty about where the caps sit).
-
-    v5: scaled by churn. In a settled market caps barely move, so the
-    size distribution should be NARROW (less widening); in a churning
-    market caps jump, so widen more. v2 widened the same whatever the
-    regime, spreading size mass over too many bins when settled.
-    """
+    marks = more uncertainty about where the caps sit)."""
     w = 1.35 + 0.30 * math.sqrt(max(horizon_hours, 0.0))
     if n_marks < 4:
         w *= 1.0 + 0.30 * (4 - n_marks) / 4.0
-    w *= 0.65 + 0.70 * max(0.0, min(1.0, churn))
     return min(w, 2.4)
 
 
@@ -346,11 +321,6 @@ def forecast(task, marks):
 
     # newcomer mass per place (from churn + mean horizon)
     newcomer = newcomer_share(churn, mean_horizon)
-    # v5: churn-adaptive temperature. In a settled market the Monte Carlo
-    # frequencies are already dispersed enough; softening them further
-    # (T=1.15) flattens real signal. Sharpen toward T=1.0 when settled,
-    # keep v2's softening when churning.
-    temp = 1.0 + 0.10 * (max(0.0, min(1.0, churn)) / 0.60)
 
     probabilities = []
     for k in range(places):
@@ -367,8 +337,7 @@ def forecast(task, marks):
             continue
         # temperature-soften the frequencies before scaling: flatten the
         # distribution a little (log score punishes overconfidence).
-        # v5: temp is churn-adaptive (see above), sharper when settled.
-        soft = [(mint, (p / s) ** (1.0 / temp)) for mint, p in named]
+        soft = [(mint, (p / s) ** (1.0 / TEMP)) for mint, p in named]
         ss = sum(p for _, p in soft)
         for mint, p in soft:
             p2 = (p / ss) * (1.0 - newcomer)
@@ -390,8 +359,7 @@ def forecast(task, marks):
         used.add(best)
     # sizes: widen the simulated histogram (model error grows with horizon
     # and thin history), then convert counts to probabilities.
-    # v5: widen is churn-scaled (narrower when settled).
-    widen = size_widen(mean_horizon, n_marks, churn)
+    widen = size_widen(mean_horizon, n_marks)
     sizes = []
     for k in range(places):
         hist = size_hist[k]
