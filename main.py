@@ -1,11 +1,32 @@
 #!/usr/bin/env python3
-"""pumpfun-top5-forecast-01: Monte Carlo log-cap forecaster (v2).
+"""pumpfun-top5-forecast-01: Monte Carlo log-cap forecaster (v5).
 
 Reads /input/task.json + /input/history.ndjson (10-minute marks of pump.fun
 coins launched since t0, ranked by market cap) and writes
 /output/forecast.json: for each of the 5 places, a probability for each coin
 named being at that place, the guessed top 5 in order, and for each place a
 probability for each log10(SOL) market-cap bin.
+
+Model (v5 changes vs v2)
+------------------------
+v2 is the proven best on the real practice score (log -34.5, rank 29);
+v3 (-35.707) and v4 (-35.6) both regressed in reality despite much
+better backtests, because backtest splits are in-sample short-horizon
+while the real practice is out-of-sample. v5 keeps v2's order model and
+removes the v3/v4 size premium entirely. It adds REGIME-ADAPTIVE
+confidence, because the practice market settled (churn 0.8 -> 0.2 at
+20:40) and v2 is underconfident there: it gives the dominant #1 coin
+only p=0.17 and leaves 40% mass unnamed.
+- Newcomer mass is MULTIPLICATIVE in churn (v2 added slope*horizon to
+  churn, so a settled market still left 0.35 unnamed at 0.5h). Now a
+  settled market stays mostly named; a churning market still opens up
+  fast and caps at 0.65 at long horizons.
+- Temperature is churn-adaptive: sharper toward T=1.0 when settled,
+  v2's T=1.15 when churning.
+- Size widening is churn-scaled: narrower in a settled market (caps
+  barely move), wider when churning. v2 widened the same in any regime.
+All three changes preserve v2's long-horizon / high-churn behaviour
+(the final grading window), so the final score should not collapse.
 
 Model (v2 changes vs v1)
 ------------------------
@@ -30,35 +51,6 @@ Model (v2 changes vs v1)
   the log score punishes overconfidence, so the raw frequencies are
   slightly flattened before they are written out.
 - 8000 Monte Carlo paths (up from 4000) for lower simulation noise.
-
-v4 changes vs v2 (diagnosis: v3's backtest was great but its REAL practice
-score was far worse than v2, place 55 vs 11)
----------------------------------------------------------------
-- v3's newcomer SIZE mixture is the culprit.  It shifts size mass up by a
-  premium with a floor (0.40 * (0.4 + churn) * ...), so even in a SETTLED
-  market (churn 0.2) it puts ~36% of each place's size mass 0.4-0.55
-  log10 above the current cap.  Measured newcomer jumps in the kit data:
-  high churn (0.8) -> +0.14..+0.94, avg +0.53; low churn (0.2) ->
-  +0.08..+0.21, avg +0.15.  Jump ~ 0.65 * churn per 10 min.  v3's floor
-  overstates the low-churn jump ~2x, and at the settled practice cut
-  (churn collapsed 0.8 -> 0.2 at 20:40) that wasted mass scores near the
-  floor while v2's incumbent-centred sizes score well.  At the latest
-  backtest cut (cut 4, settled) v2 already beats v3.
-- v4 keeps v2's order model EXACTLY (proven place 11) and adds a
-  newcomer size mixture whose premium scales DIRECTLY with churn (no
-  floor): prem = min(0.90, 0.65 * churn * sqrt(6 * horizon) *
-  (0.85 + 0.075 * (place+1))).  At high churn it matches v3's fix for
-  v2's worst split (cut 1 size -15.1); at low churn it nearly vanishes,
-  so v4 behaves like v2 at settled cuts.
-
-v4b changes vs v4
------------------
-- v4 lost at the transition cut 3 (20:30): raw churn 0.8 is stale -- the
-  market settles the very next transition (0.2) -- so v4 overstates both
-  newcomer mass and premium there.  v4b reinstates v3's age-adjusted
-  churn (tau 0.5h) for the churn estimate, so an aging market's churn is
-  pulled toward the 0.15 floor.  The premium still uses the churn-scaled
-  formula (no floor), now fed the adjusted churn.
 
 Each coin's log10 market cap (in SOL) is a Brownian motion with drift
 (per hour) and volatility (per sqrt-hour), shrunk toward global priors.
@@ -99,9 +91,6 @@ SIZE_GROWTH_PER_SQRT_H = 0.06  # place caps inflate as newcomers arrive
 TEMP = 1.15                   # temperature softening of rank frequencies
 NEWCOMER_CAP = 0.65           # max unnamed share per place
 NEWCOMER_SLOPE = 0.30         # unnamed share growth per hour of horizon
-NEWCOMER_PREM_K = 0.65        # (v4) newcomer cap jump ~ 0.65 * churn per 10 min
-NEWCOMER_PREM_CAP = 0.90      # (v4) max newcomer premium (log10)
-NEWCOMER_PREM_SD = 0.40       # (v4) sd of the newcomer-cap distribution (log10)
 START_LOGCAP = -1.0           # log10 SOL a coin effectively starts from
 
 
@@ -172,22 +161,14 @@ def top5_churn(marks):
 def newcomer_share(churn, horizon_hours):
     """Probability a place is taken by a coin no history can name.
 
-    Starts at the market's own churn rate and grows with the answer
-    horizon (more time = more births and more turnover), capped so the
-    named coins still carry real mass.
+    v5: MULTIPLICATIVE in churn and SUPERLINEAR (churn^1.5). v2 added
+    slope*horizon to churn, so even a settled market (churn 0.2) left
+    0.35 unnamed at a 0.5h horizon -- far more than the true newcomer
+    rate in a settled market, diluting every named coin. Here a settled
+    market stays mostly named (churn^1.5 crushes low churn), a churning
+    market still opens up fast and caps at 0.65 at long horizons.
     """
-    return min(NEWCOMER_CAP, churn + NEWCOMER_SLOPE * max(0.0, horizon_hours))
-
-
-def age_adjusted_churn(churn, age_hours):
-    """The churn of the most recent transition is a noisy, possibly stale
-    signal: a market's gold-rush churn collapses as it ages, so an old
-    market's churn estimate is pulled toward a low floor.  Without this,
-    a cut taken just before the market settles overstates near-future
-    turnover (cut 3: churn 0.8 but the next transition is 0.2) and the
-    newcomer mass is far too aggressive.  (v4b: reinstated from v3.)"""
-    w = math.exp(-max(age_hours, 0.0) / 0.5)
-    return churn * w + 0.15 * (1.0 - w)
+    return min(NEWCOMER_CAP, (churn ** 1.5) * (1.0 + NEWCOMER_SLOPE * max(0.0, horizon_hours)))
 
 
 def estimate_params(traj, last_time, t0):
@@ -265,13 +246,20 @@ def norm_cdf(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
-def size_widen(horizon_hours, n_marks):
+def size_widen(horizon_hours, n_marks, churn=0.30):
     """Extra widening of the simulated size distribution: grows with the
     answer horizon (model error compounds) and with thin history (fewer
-    marks = more uncertainty about where the caps sit)."""
+    marks = more uncertainty about where the caps sit).
+
+    v5: scaled by churn. In a settled market caps barely move, so the
+    size distribution should be NARROW (less widening); in a churning
+    market caps jump, so widen more. v2 widened the same whatever the
+    regime, spreading size mass over too many bins when settled.
+    """
     w = 1.35 + 0.30 * math.sqrt(max(horizon_hours, 0.0))
     if n_marks < 4:
         w *= 1.0 + 0.30 * (4 - n_marks) / 4.0
+    w *= 0.65 + 0.70 * max(0.0, min(1.0, churn))
     return min(w, 2.4)
 
 
@@ -288,8 +276,7 @@ def forecast(task, marks):
 
     traj = build_trajectories(marks, t0)
     params, mu0, sig0 = estimate_params(traj, last_mark_time, t0)
-    age_hours = (last_mark_time - t0).total_seconds() / 3600.0
-    churn = age_adjusted_churn(top5_churn(marks), age_hours)
+    churn = top5_churn(marks)
 
     # candidate set: top of last mark + best recent risers
     last_rows = sorted(marks[-1]["rows"], key=lambda r: r.get("rank", 999))
@@ -359,6 +346,11 @@ def forecast(task, marks):
 
     # newcomer mass per place (from churn + mean horizon)
     newcomer = newcomer_share(churn, mean_horizon)
+    # v5: churn-adaptive temperature. In a settled market the Monte Carlo
+    # frequencies are already dispersed enough; softening them further
+    # (T=1.15) flattens real signal. Sharpen toward T=1.0 when settled,
+    # keep v2's softening when churning.
+    temp = 1.0 + 0.10 * (max(0.0, min(1.0, churn)) / 0.60)
 
     probabilities = []
     for k in range(places):
@@ -375,7 +367,8 @@ def forecast(task, marks):
             continue
         # temperature-soften the frequencies before scaling: flatten the
         # distribution a little (log score punishes overconfidence).
-        soft = [(mint, (p / s) ** (1.0 / TEMP)) for mint, p in named]
+        # v5: temp is churn-adaptive (see above), sharper when settled.
+        soft = [(mint, (p / s) ** (1.0 / temp)) for mint, p in named]
         ss = sum(p for _, p in soft)
         for mint, p in soft:
             p2 = (p / ss) * (1.0 - newcomer)
@@ -396,22 +389,9 @@ def forecast(task, marks):
         top5.append(best)
         used.add(best)
     # sizes: widen the simulated histogram (model error grows with horizon
-    # and thin history), then convert counts to probabilities, then blend
-    # in the newcomer component (v4): a newcomer that takes a place is
-    # bigger than the incumbent it displaces, so the newcomer mass sits
-    # above the current place-k cap -- but the premium scales DIRECTLY
-    # with churn (measured: jump ~ 0.65 * churn per 10 min; high churn
-    # +0.53 avg, low churn +0.15 avg).  v3's floor (0.4 + churn) kept the
-    # premium at 0.4+ log10 even in a settled market and wasted the
-    # newcomer mass far above the real caps; v4's premium nearly vanishes
-    # when churn is low, so settled cuts behave like v2.
-    widen = size_widen(mean_horizon, n_marks)
-    cur_caps = []
-    for r in last_rows[:places]:
-        try:
-            cur_caps.append(logcap_sol(r["market_cap_lamports"]))
-        except (KeyError, TypeError, ValueError):
-            cur_caps.append(2.0)
+    # and thin history), then convert counts to probabilities.
+    # v5: widen is churn-scaled (narrower when settled).
+    widen = size_widen(mean_horizon, n_marks, churn)
     sizes = []
     for k in range(places):
         hist = size_hist[k]
@@ -422,37 +402,21 @@ def forecast(task, marks):
         var = sum((i - mean0) ** 2 * hist[i] for i in range(n_bins)) / tot
         mean = mean0 + (SIZE_GROWTH_PER_SQRT_H * math.sqrt(max(mean_horizon, 0.0))) / 0.05
         sd = math.sqrt(max(var, 0.25)) * widen
-        inc = []
+        probs = []
         for b in range(n_bins):
+            lo = -1e9 if b == 0 else edges[b - 1]
+            hi = 1e9 if b == n_bins - 1 else edges[b]
             h = hist[b] / tot
             blo = b - 0.5
             bhi = b + 0.5
             nrm = norm_cdf((bhi - mean) / sd) - norm_cdf((blo - mean) / sd) if sd > 0 else 0.0
-            inc.append(0.6 * h + 0.4 * nrm)
-        s_inc = sum(inc)
-        if s_inc <= 0:
+            p = 0.6 * h + 0.4 * nrm
+            probs.append(p)
+        s = sum(probs)
+        if s <= 0:
             continue
-        inc = [p / s_inc * 0.98 for p in inc]
-        # newcomer component: wide normal centred above the current
-        # place-k cap; premium grows with churn and horizon, larger at
-        # lower places (smaller incumbents are easier to beat by a wide
-        # margin).  No floor: at churn ~0.15 the premium is ~0.1 log10,
-        # so the mixture barely moves the distribution.
-        prem = min(NEWCOMER_PREM_CAP,
-                   NEWCOMER_PREM_K * churn * math.sqrt(6.0 * max(mean_horizon, 0.0))
-                   * (0.85 + 0.075 * (k + 1)))
-        nc_mean = cur_caps[k] + prem
-        nc_sd = NEWCOMER_PREM_SD
-        newc = []
-        for b in range(n_bins):
-            lo = -1e9 if b == 0 else edges[b - 1]
-            hi = 1e9 if b == n_bins - 1 else edges[b]
-            newc.append(norm_cdf((hi - nc_mean) / nc_sd) - norm_cdf((lo - nc_mean) / nc_sd))
-        s_new = sum(newc)
-        newc = [p / s_new * 0.98 for p in newc] if s_new > 0 else [0.0] * n_bins
-        w_new = newcomer  # same newcomer share that leaves order mass unnamed
-        for b in range(n_bins):
-            p2 = (1.0 - w_new) * inc[b] + w_new * newc[b]
+        for b, p in enumerate(probs):
+            p2 = (p / s) * 0.98
             if p2 >= 0.0005:
                 sizes.append({"place": k + 1, "bin": b, "p": round(p2, 6)})
     return {"probabilities": probabilities, "top5": top5, "sizes": sizes}

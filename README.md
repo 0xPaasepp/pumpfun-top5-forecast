@@ -168,3 +168,53 @@ different window again (7-13h horizons, 17h-old market). v3 proved a
 great backtest can still place 55. v4 is built to be robust across
 regimes rather than to maximise the backtest, but its real practice
 score is only known after submission.
+
+## v5 (current): regime-adaptive confidence — v4 also failed in reality
+
+**v4's real practice score was place 68 (log -35.6), worse than v2's
+place 29 (log -34.5), despite a backtest of +8.29.** v3 and v4 both
+proved the same lesson: backtest splits do NOT predict the real
+practice score. The backtest is in-sample and short-horizon; the real
+practice is out-of-sample in a settled market.
+
+**Diagnosis — v2 is underconfident in a settled market.** On the full
+practice input (history to 20:50, churn settled at 0.2), v2 gives the
+dominant #1 coin (7fNYfFkD, lc 3.56, a 0.24-log lead over #2) only
+p=0.173, and leaves 40% of every place's mass unnamed. In a settled
+market the incumbents mostly stay and the caps drift slowly, so that
+uncertainty is misplaced: the Monte Carlo disperses the rankings too
+much, and the additive newcomer mass (churn + 0.30*horizon) stays high
+even when churn has collapsed.
+
+**v5 = v2's order model (no size premium) + regime-adaptive confidence:**
+- Newcomer mass is multiplicative AND superlinear: churn^1.5 *
+  (1 + 0.30*horizon), capped 0.65. A settled market (churn 0.2) now
+  leaves ~0.11 unnamed at 0.5h (v2: 0.40); a churning market still
+  opens up fast and caps at 0.65 at long horizons.
+- Temperature is churn-adaptive: T = 1.0 + 0.10*(churn/0.60) --
+  sharper toward 1.0 when settled, v2's 1.15 when churning.
+- Size widening is churn-scaled: widen *= (0.65 + 0.70*churn) --
+  narrower when settled (caps barely move), wider when churning.
+All three preserve v2's long-horizon / high-churn behaviour, so the
+final grading window (7-13h) should not collapse.
+
+**Calibration on the practice input:** v5 named mass 0.893 (v2: 0.601),
+#1 coin p=0.287 (v2: 0.173), size rows 161 (v2: 188, narrower).
+
+**Backtest (13 splits): v5 avg delta +1.45, worst -14.29, best +5.52.**
+v2: +1.48 / -13.55 / +5.83. The overall avg is deliberately similar
+to v2 (v5 trades a little on churning splits for gains on settled
+ones). On the practice-relevant settled splits: cut 3 both-reads
+v5 +3.45 vs v2 +2.64 (+0.82, driven by order +2.11 vs +1.25); cut 4
+v5 +5.15 vs v2 +5.07 (+0.08). v5 is the first version since v2 that
+beats v2 on the settled splits without a big backtest (v3/v4's +8
+backtests were the trap).
+
+**Honest caveat:** the real practice answers (21:00-22:00) are not in
+the kit, so no local score can prove v5 beats v2 in reality — only the
+server grade after submission can. The settled-split gain (+0.82) is
+modest; v5 might move v2's rank 29 to roughly the mid-teens, not
+clearly into the top 10. The main risk is overconfidence: if the
+practice window churns more than the last two transitions suggest
+(churn 0.2), v5's sharper forecast loses more than v2's. The mechanism
+is sound for a settled market, but the market may not stay settled.
