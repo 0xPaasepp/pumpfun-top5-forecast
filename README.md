@@ -218,3 +218,86 @@ clearly into the top 10. The main risk is overconfidence: if the
 practice window churns more than the last two transitions suggest
 (churn 0.2), v5's sharper forecast loses more than v2's. The mechanism
 is sound for a settled market, but the market may not stay settled.
+
+## v6 (current): size-first — the shift model, v2 order unchanged
+
+**v5's real practice score was -36.5 (rank 146), worse than v2's -34.5.**
+The overconfidence backfired (order -21.62 vs v2 -19.77). v2 was
+restored as the final entry (rank 41/441, submission 01a1ce5e).
+v3, v4 and v5 all tried to beat v2 by changing the ORDER model and
+all failed in reality. v6 leaves the order model alone and fixes the
+SIZE model instead — the one component with a diagnosed, mechanistic
+error.
+
+**Diagnosis: v2's size is systematically wrong at places 4-5.**
+v2 derives each place's size from the Monte Carlo order statistics
+of independently simulated coins. Independent Brownian motions
+spread the top-5 caps far too wide. At the settled cut 4 -> 20:50
+split, v2 centres place 5 at bin 22 (log10 cap ~3.10) while the
+actual cap is bin 26 (~3.28), and place 4 at bin 24 (~3.20) vs
+actual bin 27 (~3.30). In reality the top-5 caps are a tight,
+compressed cluster (places 2-5 within 0.04 log at 20:50) because
+many coins pile up near the top; the MC's independent shocks do not
+reproduce that compression. v2 underestimates places 4-5 by
+0.10-0.18 log. That is the size leak (practice size -14.77 vs
+top-10 -14.15, rank-1 -13.56).
+
+**v6 size model ("shift"): model the place cap directly.**
+centre_k = (current logcap at place k) + g * mean_horizon, where g
+is the mean growth rate of the top-5 caps over the last transition
+(capped 0.60 log/hour, floored 0), total shift capped at 1.5 log
+(long-horizon safety for the final's 7-13h reads). Distribution is
+a narrow normal around centre_k (sd 0.10 + 0.04*sqrt(horizon)):
+the cluster is tight, so the distribution is too. Mixed 0.7 shift
++ 0.3 v2 MC size: the MC part keeps the model robust in young,
+fast-moving markets where the shift alone is overconfident.
+The current top-5 caps are already a compressed cluster, so the
+centres inherit that compression for free.
+
+**Why the order model is unchanged.** A closed-form rank
+computation (exact numerical integration, no MC) was tested and
+gives order scores identical to the MC to within 0.08 — the MC
+was already converged, so the rank computation is not the lever.
+Naming up to 100 coins per place (vs 20) gains +0.04-0.07 on the
+backtest average and ~0 on the settled splits. Flattening the
+temperature (T 1.15 -> 1.3/1.5) hurts the settled splits. The
+order score is dominated by newcomer places (3 of 5 at the
+practice's last read) that no model can name, and v2's newcomer
+mass (0.40 at the practice horizon) is already near the optimal
+trade-off. No order variation tested beat v2 on the settled splits.
+
+**Local evidence (size component, same log-score formula):**
+| split | v2 size_d | v6 size_d | gain |
+|-------|-----------|-----------|------|
+| cut 3 -> 20:40 | +3.38 | +4.43 | +1.05 |
+| cut 3 -> 20:50 | +0.26 | +4.41 | +4.15 |
+| cut 3 -> both  | +1.39 | +3.94 | +2.55 |
+| cut 4 -> 20:50 | +2.76 | +4.71 | +1.94 |
+Settled-split average gain **+2.42**, all four positive. Full
+13-split backtest: v6 avg delta +1.59 (v2 +1.48), worst -11.26
+(v2 -13.55), best +7.78 (v2 +5.83). The young-market splits are
+mixed (cut 1 multi-read and cut 2 lose ~1-2 on size) — the shift
+is overconfident while the market is still forming — but the
+practice cut and the final cut are both SETTLED markets, so the
+settled regime is the relevant one. At cut 4 -> 20:50 the fix is
+visible per place: place 5 log-score -3.08 -> -2.23, place 4
+-2.64 -> -2.08, place 1 -2.27 -> -1.93.
+
+**Validation:** deterministic (two runs byte-identical), runtime
+~6.5s (limit 300s), output valid (81 prob rows, top5 5 distinct,
+159 size rows, 13.5 KB). Order probabilities and top5 are
+identical to v2's (the order model is untouched).
+
+**Honest caveat:** v3/v4/v5 all had better backtests and scored
+worse in reality, so a backtest gain is not proof. What is
+different here: the gain is on the settled splits specifically
+(the practice regime), the mechanism is a diagnosed error rather
+than a tuned parameter, and the size model is a 0.7/0.3 mixture
+so it cannot run far from v2. If the settled-split gain transfers
+at ~50%, v6 scores ~-33.5 (just short of the -33.1 top-10
+cutoff); at ~100% it scores ~-32.5 (inside the top 10). The main
+risk is that the practice answer's size distribution behaves like
+the young-market splits rather than the settled ones — e.g. a fresh
+wave of coins in the 21:00-22:00 window would widen the place caps
+and punish the shift model's narrow distributions. The order gap
+to the top 10 (~0.8) is NOT addressed by v6.

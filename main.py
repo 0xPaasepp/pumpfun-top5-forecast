@@ -1,11 +1,60 @@
 #!/usr/bin/env python3
-"""pumpfun-top5-forecast-01: Monte Carlo log-cap forecaster (v2).
+"""pumpfun-top5-forecast-01: Monte Carlo log-cap forecaster (v6).
 
-v2 is the proven best model: practice log_score -34.5 (rank 29/340).
-v3 (-35.707), v4 (-35.6) and v5 (-36.5) all scored worse in reality
-despite better backtests / settle-split gains, so v2 is restored as
-the final entry.  Do not re-tune on backtest splits: they do not
-predict the real practice score.
+v6 = v2's order model (unchanged: it is a local optimum; v3/v4/v5 and
+every parameter variation of it scored worse in reality) + a
+STRUCTURALLY DIFFERENT size model.  The size model is the v6 idea.
+
+Why v2's size is wrong (diagnosed, not tuned)
+---------------------------------------------
+v2 derives each place's size from the Monte Carlo order statistics of
+independently simulated coins.  Independent Brownian motions spread
+the top-5 caps far too wide: at the settled cut 4 -> 20:50 split v2
+centres place 5 at bin 22 (log10 cap ~3.10) while the actual cap is
+bin 26 (~3.28), and place 4 at bin 24 (~3.20) vs actual bin 27
+(~3.30).  In reality the top-5 caps are a tight, compressed cluster
+(places 2-5 within 0.04 log of each other at 20:50) because many
+coins pile up near the top; the MC's independent shocks do not
+reproduce that compression, so v2 systematically underestimates the
+caps at places 4-5 by 0.10-0.18 log.  That is v2's size leak
+(practice size -14.77 vs top-10 -14.15).
+
+v6 size model ("shift"): do not derive a place's cap from a
+simulated coin.  Model the place cap directly:
+  centre_k = (current logcap at place k) + g * mean_horizon
+where g is the mean growth rate of the top-5 caps over the last
+transition, capped at 0.60 log/hour and floored at 0, and the total
+shift g*horizon is capped at 1.5 log (caps cannot grow forever; this
+matters at the final's 7-13h horizons).  The distribution is a
+narrow normal around centre_k (sd 0.10 + 0.04*sqrt(horizon)):
+the cluster is tight, so the distribution should be too.  The
+shift distribution is then mixed 0.7/0.3 with v2's MC size
+distribution (the MC part keeps the model robust in young,
+fast-moving markets where the shift alone is overconfident).
+
+Local evidence (backtest splits, same log-score formula)
+-------------------------------------------------------
+Size component only, mixture vs v2 MC size:
+  cut 3 -> 20:40  +1.05    cut 3 -> 20:50  +4.15
+  cut 3 -> both   +2.55    cut 4 -> 20:50  +1.94
+  settle-split average +2.42 (all four settle splits positive).
+Young-market splits are mixed (cut 1 multi-read -2.05, cut 2 -2.12)
+because the shift is overconfident when the market is still forming;
+the 0.3 MC mixture limits that damage.  The practice cut is a
+SETTLED market (churn 0.2), as is the final's 11-hour-old market,
+so the settle regime is the relevant one.
+
+Order model: unchanged from v2 (Monte Carlo, T=1.15, churn-adaptive
+newcomer mass, MAX_ROWS 20).  A closed-form rank computation was
+tested and gives identical order scores to the MC (the MC was
+already converged); naming more coins per place and flattening the
+temperature were tested and do not help the settle splits.  The
+order gap to the top 10 (~0.8) is left unaddressed: no order
+variation tested beat v2 on the settle splits, and the order score
+is dominated by newcomer places no model can name.
+
+Practice scores: v2 -34.5 (rank 41/509), v3 -35.707, v4 -35.6,
+v5 -36.5.  v6's practice score is only known after submission.
 
 Reads /input/task.json + /input/history.ndjson (10-minute marks of pump.fun
 coins launched since t0, ranked by market cap) and writes
@@ -77,6 +126,12 @@ TEMP = 1.15                   # temperature softening of rank frequencies
 NEWCOMER_CAP = 0.65           # max unnamed share per place
 NEWCOMER_SLOPE = 0.30         # unnamed share growth per hour of horizon
 START_LOGCAP = -1.0           # log10 SOL a coin effectively starts from
+# --- v6 shift size model ---
+SHIFT_W = 0.70                # weight of the shift size distribution (rest = v2 MC size)
+SHIFT_G_CAP = 0.60            # max top-5 cap growth rate, log10 per hour
+SHIFT_TOTAL_CAP = 1.5         # max total shift of a place cap, log10 (long-horizon safety)
+SHIFT_SD_BASE = 0.10          # narrow sd: the top-5 cluster is tight
+SHIFT_SD_GROWTH = 0.04        # sd grows slowly with horizon
 
 
 def parse_time(s):
@@ -238,6 +293,62 @@ def size_widen(horizon_hours, n_marks):
     return min(w, 2.4)
 
 
+def shift_size_probs(marks, mean_horizon, edges):
+    """v6 size model: model each place's cap directly instead of deriving
+    it from simulated coins.  centre_k = current logcap at place k +
+    g * mean_horizon, where g is the mean growth rate of the top-5 caps
+    over the last transition (capped, floored at 0), with the total
+    shift capped so long horizons cannot run away.  Returns a list
+    (one dict bin->p per place) of narrow normals around the centres.
+    The current top-5 caps are already a compressed cluster, so the
+    centres inherit that compression -- unlike the MC order statistics,
+    which spread places 4-5 far too low."""
+    n_bins = len(edges) + 1
+    last_rows = sorted(marks[-1]["rows"], key=lambda r: r.get("rank", 999))
+    top_now = last_rows[:5]
+    if len(marks) >= 2:
+        prev_rows = sorted(marks[-2]["rows"], key=lambda r: r.get("rank", 999))
+        top_prev = prev_rows[:5]
+        dt = (parse_time(marks[-1]["at"]) - parse_time(marks[-2]["at"])).total_seconds() / 3600.0
+        gs = []
+        for k in range(min(5, len(top_now), len(top_prev))):
+            try:
+                c_now = logcap_sol(top_now[k]["market_cap_lamports"])
+                c_prev = logcap_sol(top_prev[k]["market_cap_lamports"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if dt > 0:
+                gs.append((c_now - c_prev) / dt)
+        g = sum(gs) / len(gs) if gs else 0.0
+    else:
+        g = 0.0
+    g = max(0.0, min(g, SHIFT_G_CAP))
+    shift = min(g * max(mean_horizon, 0.0), SHIFT_TOTAL_CAP)
+    sd = SHIFT_SD_BASE + SHIFT_SD_GROWTH * math.sqrt(max(mean_horizon, 0.0))
+    out = []
+    for k in range(5):
+        if k >= len(top_now):
+            out.append({})
+            continue
+        try:
+            centre = logcap_sol(top_now[k]["market_cap_lamports"]) + shift
+        except (KeyError, TypeError, ValueError):
+            out.append({})
+            continue
+        probs = {}
+        for b in range(n_bins):
+            lo = -1e9 if b == 0 else edges[b - 1]
+            hi = 1e9 if b == n_bins - 1 else edges[b]
+            p = norm_cdf((hi - centre) / sd) - norm_cdf((lo - centre) / sd)
+            if p >= 0.0005:
+                probs[b] = p
+        s = sum(probs.values())
+        if s > 0:
+            probs = {b: p / s for b, p in probs.items()}
+        out.append(probs)
+    return out
+
+
 def forecast(task, marks):
     t0 = parse_time(task["t0"])
     places = int(task.get("places", 5))
@@ -357,9 +468,13 @@ def forecast(task, marks):
             best = max(counts, key=counts.get)
         top5.append(best)
         used.add(best)
-    # sizes: widen the simulated histogram (model error grows with horizon
-    # and thin history), then convert counts to probabilities.
+    # sizes (v6): blend v2's simulated size distribution with the shift
+    # model.  The MC part keeps the model robust in young markets; the
+    # shift part (weight SHIFT_W) fixes the MC's systematic error in
+    # settled markets, where it spreads the place caps too wide and puts
+    # places 4-5 far too low.
     widen = size_widen(mean_horizon, n_marks)
+    shift_probs = shift_size_probs(marks, mean_horizon, edges)
     sizes = []
     for k in range(places):
         hist = size_hist[k]
@@ -370,7 +485,7 @@ def forecast(task, marks):
         var = sum((i - mean0) ** 2 * hist[i] for i in range(n_bins)) / tot
         mean = mean0 + (SIZE_GROWTH_PER_SQRT_H * math.sqrt(max(mean_horizon, 0.0))) / 0.05
         sd = math.sqrt(max(var, 0.25)) * widen
-        probs = []
+        mc_probs = {}
         for b in range(n_bins):
             lo = -1e9 if b == 0 else edges[b - 1]
             hi = 1e9 if b == n_bins - 1 else edges[b]
@@ -379,11 +494,20 @@ def forecast(task, marks):
             bhi = b + 0.5
             nrm = norm_cdf((bhi - mean) / sd) - norm_cdf((blo - mean) / sd) if sd > 0 else 0.0
             p = 0.6 * h + 0.4 * nrm
-            probs.append(p)
-        s = sum(probs)
+            if p > 0:
+                mc_probs[b] = p
+        s_mc = sum(mc_probs.values())
+        if s_mc > 0:
+            mc_probs = {b: p / s_mc for b, p in mc_probs.items()}
+        sh = shift_probs[k] if k < len(shift_probs) else {}
+        all_bins = set(mc_probs) | set(sh)
+        blended = {}
+        for b in all_bins:
+            blended[b] = SHIFT_W * sh.get(b, 0.0) + (1.0 - SHIFT_W) * mc_probs.get(b, 0.0)
+        s = sum(blended.values())
         if s <= 0:
             continue
-        for b, p in enumerate(probs):
+        for b, p in blended.items():
             p2 = (p / s) * 0.98
             if p2 >= 0.0005:
                 sizes.append({"place": k + 1, "bin": b, "p": round(p2, 6)})
