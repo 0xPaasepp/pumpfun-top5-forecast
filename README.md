@@ -126,3 +126,45 @@ MAKEFUN_INPUT_DIR=<kit>/input MAKEFUN_OUTPUT_DIR=out python3 main.py
 
 Runtime ~7s on the dev history; well under the 300s limit. Two runs on
 the same history produce byte-identical output.
+
+## v4 (current): why v3 failed in reality, and the fix
+
+**v3's real practice score was place 55, far worse than v2's place 11,
+despite a much better backtest (+8.80 vs +1.48 avg delta, all splits
+positive).** Diagnosis from the kit data:
+
+- Top-5 churn collapsed 0.8 -> 0.2 at 20:40 and stayed there: the market
+  settled before the practice cut (21:00). At the latest backtest cut
+  (cut 4, settled) v2 already beats v3.
+- Measured newcomer cap jumps: high churn (0.8) -> +0.14..+0.94, avg
+  +0.53; low churn (0.2) -> +0.08..+0.21, avg +0.15. Jump ~ 0.65 *
+  churn per 10 min.
+- v3's newcomer size mixture used a premium with a floor
+  (0.40 * (0.4 + churn) * ...), so even in a settled market it shifted
+  ~36% of each place's size mass 0.4-0.55 log10 above the current cap --
+  ~2x the real low-churn jump. In a settled market the real caps stay
+  near the incumbents, so that mass scored near the floor.
+
+**v4 = v2's proven order model + a churn-scaled newcomer size mixture:**
+premium = min(0.90, 0.65 * churn * sqrt(6 * horizon) *
+(0.85 + 0.075 * (place+1))) -- no floor, so it matches v3's fix at high
+churn (fixes v2's worst split, cut 1 size -15.1) and nearly vanishes at
+low churn (behaves like v2 at settled cuts). Plus v3's age-adjusted
+churn (tau 0.5h) for the churn estimate, so a cut taken just before the
+market settles (cut 3: churn 0.8 but next transition 0.2) does not
+overstate turnover.
+
+**Backtest (13 splits): v4 avg delta +8.29, worst +2.43, best +19.27 --
+all splits positive.** v2: +1.48 / -13.55 / +5.83. v3: +8.80 / +2.60 /
++20.65. On the practice-relevant proxies (cut 3 both-reads, cut 4):
+v4 +3.37 / +4.62, v3 +3.19 / +4.59, v2 +2.64 / +5.07. On the full
+practice input, v4's forecast sits closest to v2's (the proven model),
+unlike v3 which shifts size mass +1.6..+3.3 bins above v2 at places 3-5.
+
+**Honest caveat:** the backtest is in-sample (answers inside the history
+window, 10-40 min horizons) while the real practice is out-of-sample
+(answers 21:00-22:00, settled market) and the final grading is a
+different window again (7-13h horizons, 17h-old market). v3 proved a
+great backtest can still place 55. v4 is built to be robust across
+regimes rather than to maximise the backtest, but its real practice
+score is only known after submission.
