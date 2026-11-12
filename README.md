@@ -45,6 +45,32 @@ Three things the v1 model got wrong, fixed in v2:
   a coin that just rocketed up usually cools rather than compounding
   its entry sprint, so the negative global prior is the better default.)
 
+Two things v2 still got wrong, fixed in v3:
+
+- **Newcomer size mixture.** v2's size distribution was purely the
+  simulated incumbent coins, so at young/high-churn cuts it put most
+  mass on tiny caps for places 2–5 while the real answer was set by
+  newcomers arriving with much larger caps (observed newcomer jumps
+  +0.3 to +0.9 log10 per 10 min, biggest at the lower places). Each
+  place's size distribution is now a mixture: (1 − newcomer share) of
+  the simulated incumbent distribution plus newcomer share of a
+  newcomer distribution — a wide normal centred above the current
+  place-k cap (a newcomer that displaces the incumbent is bigger than
+  it). The premium grows with the horizon, is larger at lower places,
+  and scales with the market's churn (hot markets: newcomers rocket;
+  settled markets: they barely exceed the incumbent). The multipliers
+  are deliberately mild — the premium is the *average* newcomer jump,
+  not the largest — because an over-aggressive premium wastes the
+  newcomer mass far above the real caps when churn collapses.
+- **Age-adjusted churn.** The churn of the most recent transition is a
+  noisy, possibly stale signal: a market's gold-rush churn collapses
+  as it ages (the rehearsal goes 0.80 → 0.20 within ~30–40 minutes),
+  so an old market's churn estimate is pulled toward a low floor
+  (exp decay, tau 0.5h). Without this, a cut taken just before the
+  market settles overstates near-future turnover and the newcomer mass
+  (order and size) is far too aggressive. This single change turned
+  v2's worst mature-cut splits from negative to clearly positive.
+
 ## Why it beats persistence
 
 The house baseline bets the last mark's order holds. In the rehearsal the
@@ -52,43 +78,43 @@ top 5 turns over fast (only 1 of the top 5 at 20:10 was still there at
 20:50), and the place caps inflate steadily as new coins arrive. This
 forecaster prices momentum, survival, and newcomer mass instead of
 freezing the last snapshot. Its edge is largest at mature cuts and
-longer horizons, where persistence is weakest.
+longer horizons, where persistence is weakest — and v3's newcomer size
+mixture closes the young-market size leak that was v2's biggest loss.
 
 ## Local backtest (same log-score formula as the rules)
 
 Scored against later marks as pseudo-answer reads, on the dev rehearsal
-(all 10 single-answer splits; delta = this model minus persistence):
+(13 splits: 10 single-answer + 3 multi-answer; delta = this model minus
+persistence). v3 vs v2:
 
-| cut | answer | this model | baseline | delta |
-|-----|--------|-----------|----------|-------|
-| 20:10 | 20:20 | -55.58 | -42.03 | -13.55 |
-| 20:10 | 20:30 | -60.41 | -62.64 | +2.23 |
-| 20:10 | 20:40 | -61.19 | -65.29 | +4.10 |
-| 20:10 | 20:50 | -60.88 | -66.72 | +5.83 |
-| 20:20 | 20:30 | -50.39 | -47.78 | -2.61 |
-| 20:20 | 20:40 | -48.87 | -49.38 | +0.51 |
-| 20:20 | 20:50 | -49.65 | -52.72 | +3.07 |
-| 20:30 | 20:40 | -27.19 | -29.65 | +2.47 |
-| 20:30 | 20:50 | -33.67 | -37.31 | +3.63 |
-| 20:40 | 20:50 | -24.80 | -29.87 | +5.07 |
+| cut | answer | v3 | baseline | v3 delta | v2 delta |
+|-----|--------|----|----------|----------|----------|
+| 20:10 | 20:20 | -39.43 | -42.03 | +2.60 | -13.55 |
+| 20:10 | 20:30 | -47.58 | -62.64 | +15.06 | +2.23 |
+| 20:10 | 20:40 | -46.29 | -65.29 | +19.00 | +4.10 |
+| 20:10 | 20:50 | -46.06 | -66.72 | +20.65 | +5.83 |
+| 20:10 | all 4 | -45.09 | -59.17 | +14.08 | +3.75 |
+| 20:20 | 20:30 | -44.00 | -47.78 | +3.78 | -2.61 |
+| 20:20 | 20:40 | -42.21 | -49.38 | +7.16 | +0.51 |
+| 20:20 | 20:50 | -42.59 | -52.72 | +10.13 | +3.07 |
+| 20:20 | all 3 | -42.88 | -49.96 | +7.08 | +2.13 |
+| 20:30 | 20:40 | -26.62 | -29.65 | +3.03 | +2.47 |
+| 20:30 | 20:50 | -33.25 | -37.31 | +4.06 | +3.63 |
+| 20:30 | both | -30.29 | -33.48 | +3.19 | +2.64 |
+| 20:40 | 20:50 | -25.28 | -29.87 | +4.59 | +5.07 |
 
-Average delta **+1.08** (v1: -1.05); worst split **-13.55** (v1: -16.37).
-Multi-answer splits: cut 20:30 -> 20:40+20:50 **+2.64**; cut 20:20 ->
-20:30+20:40+20:50 **+2.13**; cut 20:40 -> 20:50 **+5.07**.
-
-Known weakness: the 20:10 -> 20:20 split (a 10-minute-old market, 4 of
-5 top-5 slots taken by coins born after the cut) is still far behind
-persistence, and the 20:30 splits lag v1 slightly — at 20:30 the market
-is just about to calm down from 0.80 to 0.20 churn, which no history
-available at the cut can foresee (a regime change). The practice and
-final both run on mature markets (6 marks / 11 hours of history), where
-the model is at its best.
+Average delta **+8.80** (v2: +1.48); worst split **+2.60** (v2: −13.55);
+best **+20.65**. Every split is now positive — v3 has no losing regime
+in the rehearsal. The mature cuts (20:30, 20:40 — the closest analogues
+of the real practice cut at 20:50 and the 11-hour final cut) all beat
+v2 except 20:40 → 20:50, which trails v2 by 0.48 on a single 10-minute
+read.
 
 The baseline scores -40.41 on the official practice. The model beats it
-on the mature splits and is far ahead on long horizons. (The
-competition's own `grade-local` cannot score this bounty locally — its
-scorer/reference are server-only — so these are backtests with the
-identical formula, not the official practice score.)
+on every backtest split. (The competition's own `grade-local` cannot
+score this bounty locally — its scorer/reference are server-only — so
+these are backtests with the identical formula, not the official
+practice score.)
 
 ## Run
 
@@ -98,5 +124,5 @@ MAKEFUN_INPUT_DIR=<kit>/input MAKEFUN_OUTPUT_DIR=out python3 main.py
 # writes out/forecast.json (probabilities, top5, sizes)
 ```
 
-Runtime ~6.5s on the dev history; well under the 300s limit. Two runs on
+Runtime ~7s on the dev history; well under the 300s limit. Two runs on
 the same history produce byte-identical output.

@@ -31,6 +31,20 @@ Model (v2 changes vs v1)
   slightly flattened before they are written out.
 - 8000 Monte Carlo paths (up from 4000) for lower simulation noise.
 
+v3 changes vs v2
+----------------
+- Newcomer size mixture (the big fix): v2's size distribution was purely
+  the simulated incumbent coins, so at young/high-churn cuts it put most
+  mass on tiny caps for places 2-5 while the real answer was set by
+  newcomers arriving with much larger caps (observed newcomer jumps
+  +0.3 to +0.9 log10 per 10 min, biggest at the lower places).  Each
+  place's size distribution is now a mixture: (1 - newcomer_share) of the
+  simulated incumbent distribution plus newcomer_share of a newcomer
+  distribution -- a wide normal centred above the current place-k cap
+  (a newcomer that displaces the incumbent is bigger than it), the
+  premium growing with the horizon and larger at lower places.  This
+  directly attacks v2's worst split (cut 20:10 -> 20:20, size -15.1).
+
 Each coin's log10 market cap (in SOL) is a Brownian motion with drift
 (per hour) and volatility (per sqrt-hour), shrunk toward global priors.
 Graduated (pool, complete) coins are steadier.  A fade hazard lets weak
@@ -67,9 +81,12 @@ GRAD_DRIFT_PULL = 0.5         # graduated drift pulled halfway to 0
 FADE_FLOOR_LOGCAP = 1.0       # a faded coin collapses toward log10 cap ~1.0
 DRIFT_TAU_HOURS = 3.0         # a hot streak mean-reverts over ~3h
 SIZE_GROWTH_PER_SQRT_H = 0.06  # place caps inflate as newcomers arrive
-TEMP = 1.15                   # temperature softening of rank frequencies
+TEMP = 1.15                  # temperature softening of rank frequencies
 NEWCOMER_CAP = 0.65           # max unnamed share per place
 NEWCOMER_SLOPE = 0.30         # unnamed share growth per hour of horizon
+NEWCOMER_PREM = 0.40          # (v3) log10 jump when a newcomer takes a place (per 10 min)
+NEWCOMER_PREM_CAP = 0.90       # (v3) max newcomer premium (log10)
+NEWCOMER_PREM_SD = 0.40       # (v3) sd of the newcomer-cap distribution (log10)
 START_LOGCAP = -1.0           # log10 SOL a coin effectively starts from
 
 
@@ -145,6 +162,18 @@ def newcomer_share(churn, horizon_hours):
     named coins still carry real mass.
     """
     return min(NEWCOMER_CAP, churn + NEWCOMER_SLOPE * max(0.0, horizon_hours))
+
+
+def age_adjusted_churn(churn, age_hours):
+    """The churn of the most recent transition is a noisy, possibly stale
+    signal: a market's gold-rush churn collapses as it ages (the rehearsal
+    goes 0.80 -> 0.20 within ~30-40 minutes), so an old market's churn
+    estimate is pulled toward a low floor.  Without this, a cut taken
+    just before the market settles overstates near-future turnover and
+    the newcomer mass (order and size) is far too aggressive.
+    """
+    w = math.exp(-max(age_hours, 0.0) / 0.5)
+    return churn * w + 0.15 * (1.0 - w)
 
 
 def estimate_params(traj, last_time, t0):
@@ -245,7 +274,8 @@ def forecast(task, marks):
 
     traj = build_trajectories(marks, t0)
     params, mu0, sig0 = estimate_params(traj, last_mark_time, t0)
-    churn = top5_churn(marks)
+    age_hours = (last_mark_time - t0).total_seconds() / 3600.0
+    churn = age_adjusted_churn(top5_churn(marks), age_hours)
 
     # candidate set: top of last mark + best recent risers
     last_rows = sorted(marks[-1]["rows"], key=lambda r: r.get("rank", 999))
@@ -352,8 +382,19 @@ def forecast(task, marks):
         top5.append(best)
         used.add(best)
     # sizes: widen the simulated histogram (model error grows with horizon
-    # and thin history), then convert counts to probabilities.
+    # and thin history), then convert counts to probabilities, then blend
+    # in the newcomer component (v3): a newcomer that takes a place is
+    # bigger than the incumbent it displaces, so the newcomer mass sits
+    # above the current place-k cap.  Without this the size distribution
+    # at young/high-churn cuts collapses onto tiny caps and the real
+    # (newcomer-set) caps score near the floor.
     widen = size_widen(mean_horizon, n_marks)
+    cur_caps = []
+    for r in last_rows[:places]:
+        try:
+            cur_caps.append(logcap_sol(r["market_cap_lamports"]))
+        except (KeyError, TypeError, ValueError):
+            cur_caps.append(2.0)
     sizes = []
     for k in range(places):
         hist = size_hist[k]
@@ -364,21 +405,44 @@ def forecast(task, marks):
         var = sum((i - mean0) ** 2 * hist[i] for i in range(n_bins)) / tot
         mean = mean0 + (SIZE_GROWTH_PER_SQRT_H * math.sqrt(max(mean_horizon, 0.0))) / 0.05
         sd = math.sqrt(max(var, 0.25)) * widen
-        probs = []
+        inc = []
         for b in range(n_bins):
-            lo = -1e9 if b == 0 else edges[b - 1]
-            hi = 1e9 if b == n_bins - 1 else edges[b]
             h = hist[b] / tot
             blo = b - 0.5
             bhi = b + 0.5
             nrm = norm_cdf((bhi - mean) / sd) - norm_cdf((blo - mean) / sd) if sd > 0 else 0.0
-            p = 0.6 * h + 0.4 * nrm
-            probs.append(p)
-        s = sum(probs)
-        if s <= 0:
+            inc.append(0.6 * h + 0.4 * nrm)
+        s_inc = sum(inc)
+        if s_inc <= 0:
             continue
-        for b, p in enumerate(probs):
-            p2 = (p / s) * 0.98
+        inc = [p / s_inc * 0.98 for p in inc]
+        # newcomer component: wide normal centred above the current
+        # place-k cap; premium grows with horizon (more turnover) and is
+        # larger at lower places (smaller incumbents are easier to beat
+        # by a wide margin).  It also scales with the market's churn:
+        # in a hot, high-churn market newcomers rocket (+0.5 or more per
+        # 10 min); in a settled market they barely exceed the incumbent
+        # (+0.1), so a fixed premium misplaces mass at mature cuts.
+        # The multipliers are deliberately mild: the premium is the
+        # AVERAGE newcomer jump, not the largest, and the wide sd covers
+        # the spread -- an over-aggressive premium wastes the newcomer
+        # mass far above the real caps when churn collapses.
+        churn_adj = 0.4 + churn
+        prem = min(NEWCOMER_PREM_CAP,
+                   NEWCOMER_PREM * churn_adj * math.sqrt(6.0 * max(mean_horizon, 0.0))
+                   * (0.85 + 0.075 * (k + 1)))
+        nc_mean = cur_caps[k] + prem
+        nc_sd = NEWCOMER_PREM_SD
+        newc = []
+        for b in range(n_bins):
+            lo = -1e9 if b == 0 else edges[b - 1]
+            hi = 1e9 if b == n_bins - 1 else edges[b]
+            newc.append(norm_cdf((hi - nc_mean) / nc_sd) - norm_cdf((lo - nc_mean) / nc_sd))
+        s_new = sum(newc)
+        newc = [p / s_new * 0.98 for p in newc] if s_new > 0 else [0.0] * n_bins
+        w_new = newcomer  # same newcomer share that leaves order mass unnamed
+        for b in range(n_bins):
+            p2 = (1.0 - w_new) * inc[b] + w_new * newc[b]
             if p2 >= 0.0005:
                 sizes.append({"place": k + 1, "bin": b, "p": round(p2, 6)})
     return {"probabilities": probabilities, "top5": top5, "sizes": sizes}
